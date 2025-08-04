@@ -53,6 +53,30 @@ const genericExport = async (
     throw new TypeError(`key is not a ${keyType} key`)
   }
 
+  if (isMLDSAAlgorithm(key.algorithm.name)) {
+    if (keyFormat === 'pkcs8') {
+      // Export private key using raw-seed format and wrap in PKCS#8 structure
+      try {
+        const seedBuffer = await crypto.subtle.exportKey('raw-seed' as any, key)
+        const seed = new Uint8Array(seedBuffer as ArrayBuffer)
+        const pkcs8Der = createMLDSAPKCS8(key.algorithm.name, seed)
+        return formatPEM(encodeBase64(pkcs8Der), 'PRIVATE KEY')
+      } catch (cause) {
+        throw new TypeError('Failed to export ML-DSA private key', { cause })
+      }
+    } else if (keyFormat === 'spki') {
+      // Export public key using raw-public format and wrap in SPKI structure
+      try {
+        const publicKeyBuffer = await crypto.subtle.exportKey('raw-public' as any, key)
+        const publicKey = new Uint8Array(publicKeyBuffer as ArrayBuffer)
+        const spkiDer = createMLDSASPKI(key.algorithm.name, publicKey)
+        return formatPEM(encodeBase64(spkiDer), 'PUBLIC KEY')
+      } catch (cause) {
+        throw new TypeError('Failed to export ML-DSA public key', { cause })
+      }
+    }
+  }
+
   return formatPEM(
     encodeBase64(new Uint8Array(await crypto.subtle.exportKey(keyFormat, key))),
     `${keyType.toUpperCase()} KEY`,
@@ -215,6 +239,89 @@ const isMLDSAAlgorithm = (alg: string): alg is MLDSAAlgorithm => {
 
 /** Union type for supported ML-DSA algorithm identifiers */
 type MLDSAAlgorithm = 'ML-DSA-44' | 'ML-DSA-65' | 'ML-DSA-87'
+
+/** Creates ASN.1 DER length encoding */
+const encodeLength = (length: number): Uint8Array => {
+  if (length < 0x80) {
+    // Short form: length fits in 7 bits
+    return new Uint8Array([length])
+  }
+
+  // Long form: need multiple bytes
+  const bytes: number[] = []
+  let temp = length
+  while (temp > 0) {
+    bytes.unshift(temp & 0xff)
+    temp >>>= 8
+  }
+
+  return new Uint8Array([0x80 | bytes.length, ...bytes])
+}
+
+/** Creates ASN.1 DER TLV (Tag-Length-Value) structure */
+const createTLV = (tag: number, content: Uint8Array): Uint8Array => {
+  const lengthBytes = encodeLength(content.length)
+  const result = new Uint8Array(1 + lengthBytes.length + content.length)
+  result[0] = tag
+  result.set(lengthBytes, 1)
+  result.set(content, 1 + lengthBytes.length)
+  return result
+}
+
+/** Creates ML-DSA algorithm identifier with OID */
+const createMLDSAAlgorithmIdentifier = (alg: MLDSAAlgorithm): Uint8Array => {
+  const finalArcMap: Record<MLDSAAlgorithm, number> = {
+    'ML-DSA-44': 0x11, // 17 for 2.16.840.1.101.3.4.3.17
+    'ML-DSA-65': 0x12, // 18 for 2.16.840.1.101.3.4.3.18
+    'ML-DSA-87': 0x13, // 19 for 2.16.840.1.101.3.4.3.19
+  }
+
+  const finalArc = finalArcMap[alg]
+  const oid = new Uint8Array([0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, finalArc])
+  const oidTLV = createTLV(0x06, oid) // OBJECT IDENTIFIER
+
+  return createTLV(0x30, oidTLV) // SEQUENCE
+}
+
+/** Creates ML-DSA PKCS#8 private key structure from raw seed */
+const createMLDSAPKCS8 = (alg: MLDSAAlgorithm, seed: Uint8Array): Uint8Array => {
+  // Version: INTEGER 0
+  const version = createTLV(0x02, new Uint8Array([0x00]))
+
+  // Algorithm identifier
+  const algorithmId = createMLDSAAlgorithmIdentifier(alg)
+
+  // Private key: OCTET STRING containing seed with context-specific tag [0]
+  const seedWithTag = createTLV(0x80, seed) // [0] IMPLICIT OCTET STRING
+  const privateKey = createTLV(0x04, seedWithTag) // OCTET STRING
+
+  // Combine all elements in SEQUENCE
+  const elements = new Uint8Array(version.length + algorithmId.length + privateKey.length)
+  elements.set(version, 0)
+  elements.set(algorithmId, version.length)
+  elements.set(privateKey, version.length + algorithmId.length)
+
+  return createTLV(0x30, elements) // Outer SEQUENCE
+}
+
+/** Creates ML-DSA SPKI public key structure from raw public key */
+const createMLDSASPKI = (alg: MLDSAAlgorithm, publicKey: Uint8Array): Uint8Array => {
+  // Algorithm identifier
+  const algorithmId = createMLDSAAlgorithmIdentifier(alg)
+
+  // Subject public key: BIT STRING (prepend with 0x00 for unused bits)
+  const publicKeyWithPadding = new Uint8Array(publicKey.length + 1)
+  publicKeyWithPadding[0] = 0x00 // No unused bits
+  publicKeyWithPadding.set(publicKey, 1)
+  const subjectPublicKey = createTLV(0x03, publicKeyWithPadding) // BIT STRING
+
+  // Combine algorithm identifier and public key in SEQUENCE
+  const elements = new Uint8Array(algorithmId.length + subjectPublicKey.length)
+  elements.set(algorithmId, 0)
+  elements.set(subjectPublicKey, algorithmId.length)
+
+  return createTLV(0x30, elements) // Outer SEQUENCE
+}
 
 /** Validates ML-DSA algorithm OID in the algorithm identifier section */
 const validateMLDSAAlgorithmIdentifier = (
