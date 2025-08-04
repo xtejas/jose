@@ -208,6 +208,46 @@ const parseECAlgorithmIdentifier = (parser: ASN1Parser): string => {
   throw new Error('Unsupported named curve')
 }
 
+/** Checks if the algorithm is a post-quantum ML-DSA algorithm */
+const isMLDSAAlgorithm = (alg: string): alg is MLDSAAlgorithm => {
+  return alg === 'ML-DSA-44' || alg === 'ML-DSA-65' || alg === 'ML-DSA-87'
+}
+
+/** Union type for supported ML-DSA algorithm identifiers */
+type MLDSAAlgorithm = 'ML-DSA-44' | 'ML-DSA-65' | 'ML-DSA-87'
+
+/** Validates ML-DSA algorithm OID in the algorithm identifier section */
+const validateMLDSAAlgorithmIdentifier = (
+  parser: ASN1Parser,
+  expectedAlg: MLDSAAlgorithm,
+): void => {
+  // Final arc mapping for each ML-DSA variant
+  const finalArcMap: Record<MLDSAAlgorithm, number> = {
+    'ML-DSA-44': 0x11, // 17 for 2.16.840.1.101.3.4.3.17
+    'ML-DSA-65': 0x12, // 18 for 2.16.840.1.101.3.4.3.18
+    'ML-DSA-87': 0x13, // 19 for 2.16.840.1.101.3.4.3.19
+  }
+
+  const expectedFinalArc = finalArcMap[expectedAlg]
+
+  // Complete ML-DSA OID: 2.16.840.1.101.3.4.3.{17|18|19}
+  const expectedOid = [0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, expectedFinalArc]
+
+  // Validate OID tag and length
+  parser.expectTag(0x06, `Invalid ML-DSA OID tag`)
+  parser.expectLength(expectedOid.length, `Invalid ML-DSA OID length`)
+
+  // Validate all OID bytes in a single loop
+  for (let i = 0; i < expectedOid.length; i++) {
+    const expected = expectedOid[i]
+    const actual = parser.data[parser.pos]
+    if (actual !== expected) {
+      throw new Error(`Invalid ML-DSA OID`)
+    }
+    parser.pos += 1
+  }
+}
+
 const genericImport = async (
   keyFormat: 'spki' | 'pkcs8',
   keyData: Uint8Array,
@@ -273,6 +313,12 @@ const genericImport = async (
       algorithm = { name: 'Ed25519' }
       keyUsages = getSigUsages()
       break
+    case 'ML-DSA-44':
+    case 'ML-DSA-65':
+    case 'ML-DSA-87':
+      algorithm = { name: alg }
+      keyUsages = getSigUsages()
+      break
     default:
       throw new JOSENotSupported('Invalid or unsupported "alg" (Algorithm) value')
   }
@@ -302,6 +348,59 @@ export const fromPKCS8: PEMImportFunction = (pem, alg, options?) => {
 
   let opts: Parameters<typeof genericImport>[3] = options
 
+  if (isMLDSAAlgorithm(alg)) {
+    // Inline ML-DSA private key import logic
+    const parser = new ASN1Parser(keyData)
+
+    try {
+      // Inline extractMLDSASeed logic
+      const { algIdStart, algIdLength } = parsePKCS8Header(parser)
+
+      // Validate the OID in the algorithm identifier
+      validateMLDSAAlgorithmIdentifier(parser, alg)
+
+      // Skip to the end of the algorithm identifier
+      parser.pos = algIdStart + algIdLength
+
+      // Parse privateKey (OCTET STRING containing ML-DSA-PrivateKey)
+      parser.expectTag(0x04, 'Expected private key octet string')
+      parser.parseLength() // Skip private key length
+
+      // Now parse the ML-DSA-PrivateKey structure inside the OCTET STRING
+      const tag = parser.getSubarray(1)[0]
+      const length = parser.parseLength()
+
+      let seed: Uint8Array
+      if (tag === 0x80) {
+        // Case 1: seed [0] OCTET STRING (SIZE (32))
+        if (length !== 32) throw new Error('Invalid seed length')
+        seed = parser.getSubarray(32)
+      } else if (tag === 0x04) {
+        // Case 2: expandedKey OCTET STRING (SIZE (2560))
+        throw new Error('No seed in expanded key')
+      } else if (tag === 0x30) {
+        // Case 3: both SEQUENCE { seed OCTET STRING (SIZE (32)), expandedKey OCTET STRING (SIZE (2560)) }
+        // Parse seed from the sequence
+        parser.expectTag(0x04, 'Expected seed octet string in sequence')
+        const seedLen = parser.parseLength()
+        if (seedLen !== 32) throw new Error('Invalid seed length in sequence')
+        seed = parser.getSubarray(32)
+      } else {
+        throw new Error('Unsupported ML-DSA key format')
+      }
+
+      return crypto.subtle.importKey(
+        'raw-seed' as any,
+        seed,
+        { name: alg },
+        options?.extractable ?? false,
+        ['sign'],
+      )
+    } catch (cause) {
+      throw new TypeError('Invalid ML-DSA private key', { cause })
+    }
+  }
+
   if (alg?.startsWith?.('ECDH-ES')) {
     opts ||= {}
     opts.getNamedCurve = (keyData: Uint8Array) => {
@@ -318,6 +417,59 @@ export const fromSPKI: PEMImportFunction = (pem, alg, options?) => {
   const keyData = processPEMData(pem, /(?:-----(?:BEGIN|END) PUBLIC KEY-----|\s)/g)
 
   let opts: Parameters<typeof genericImport>[3] = options
+  if (isMLDSAAlgorithm(alg)) {
+    // Inline ML-DSA public key import logic
+    const parser = new ASN1Parser(keyData)
+
+    try {
+      // Inline extractMLDSAPublicKey logic
+      const { algIdStart, algIdLength } = parseSPKIHeader(parser)
+
+      // Validate the OID in the algorithm identifier
+      validateMLDSAAlgorithmIdentifier(parser, alg)
+
+      // Skip to the end of the algorithm identifier
+      parser.pos = algIdStart + algIdLength
+
+      // Parse subjectPublicKey (BIT STRING)
+      parser.expectTag(0x03, 'Expected public key bit string')
+      const bitStringLen = parser.parseLength()
+
+      // Skip the unused bits byte (first byte of BIT STRING content)
+      parser.pos++
+
+      // Extract the actual public key bytes (remaining BIT STRING content)
+      const publicKeyLen = bitStringLen - 1 // Subtract 1 for the unused bits byte
+      const publicKey = parser.getSubarray(publicKeyLen)
+
+      // Validate extracted public key length
+      if (publicKey.byteLength === 0) {
+        throw new Error('Empty ML-DSA public key')
+      }
+
+      // Validate algorithm-specific public key length
+      const expectedLengths: Record<MLDSAAlgorithm, number> = {
+        'ML-DSA-44': 1312,
+        'ML-DSA-65': 1952,
+        'ML-DSA-87': 2592,
+      }
+
+      const expectedLen = expectedLengths[alg]
+      if (expectedLen && publicKey.byteLength !== expectedLen) {
+        throw new Error(`Invalid ${alg} key length`)
+      }
+
+      return crypto.subtle.importKey(
+        'raw-public' as any,
+        publicKey,
+        { name: alg },
+        options?.extractable ?? true,
+        ['verify'],
+      )
+    } catch (cause) {
+      throw new TypeError('Invalid ML-DSA public key', { cause })
+    }
+  }
 
   if (alg?.startsWith?.('ECDH-ES')) {
     opts ||= {}
